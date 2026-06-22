@@ -5,7 +5,7 @@ import JSONEditor from '@json-editor/json-editor'
 import type { DeviceConfig, DeviceCategory } from './types'
 import './App.css'
 
-type ViewMode = 'form' | 'raw'
+type ViewMode = 'form' | 'raw' | 'tree'
 
 function App() {
   const [categories, setCategories] = useState<DeviceCategory[]>([])
@@ -16,6 +16,7 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [viewMode, setViewMode] = useState<ViewMode>('form')
   const [rawJson, setRawJson] = useState('')
+  const [treeData, setTreeData] = useState<string>('')
   const editorRef = useRef<HTMLDivElement>(null)
   const editorInstance = useRef<JSONEditor | null>(null)
 
@@ -36,8 +37,15 @@ function App() {
     if (selectedDevice && editorRef.current && viewMode === 'form') {
       destroyEditor()
 
+      // Check if JSON is too complex for form view - silently switch to raw
+      if (isComplexJson(selectedDevice.data)) {
+        setViewMode('raw')
+        setRawJson(JSON.stringify(selectedDevice.data, null, 2))
+        return
+      }
+
       try {
-        const schema = generateSchema(selectedDevice.data)
+        const schema = generateSimpleSchema(selectedDevice.data)
 
         editorInstance.current = new JSONEditor(editorRef.current, {
           schema,
@@ -45,9 +53,6 @@ function App() {
           theme: 'bootstrap4',
           iconlib: 'fontawesome5',
           compact: true,
-          disable_edit_json: true,
-          disable_properties: true,
-          disable_array_reorder: true,
         })
 
         editorInstance.current.on('change', () => {
@@ -62,7 +67,6 @@ function App() {
         })
       } catch (err) {
         console.error('Editor init failed:', err)
-        setError('表单渲染失败，已切换到原始编辑模式')
         setViewMode('raw')
         setRawJson(JSON.stringify(selectedDevice.data, null, 2))
       }
@@ -72,8 +76,118 @@ function App() {
       setRawJson(JSON.stringify(selectedDevice.data, null, 2))
     }
 
+    if (viewMode === 'tree' && selectedDevice) {
+      setTreeData(renderTree(selectedDevice.data, 0))
+    }
+
     return () => destroyEditor()
   }, [selectedDevice, viewMode, destroyEditor])
+
+  function isComplexJson(data: unknown): boolean {
+    if (data === null || typeof data !== 'object') return false
+    if (Array.isArray(data)) return true
+
+    const entries = Object.entries(data as Record<string, unknown>)
+    if (entries.length > 10) return true
+
+    for (const [, value] of entries) {
+      if (Array.isArray(value)) return true
+      if (typeof value === 'object' && value !== null) {
+        const subEntries = Object.entries(value as Record<string, unknown>)
+        if (subEntries.length > 5) return true
+      }
+    }
+    return false
+  }
+
+  function renderTree(data: unknown, indent: number): string {
+    const prefix = '  '.repeat(indent)
+    let result = ''
+
+    if (Array.isArray(data)) {
+      result += `${prefix}[\n`
+      data.forEach((item, i) => {
+        result += renderTree(item, indent + 1)
+        if (i < data.length - 1) result += ',\n'
+      })
+      result += `\n${prefix}]`
+    } else if (data !== null && typeof data === 'object') {
+      result += `${prefix}{\n`
+      const entries = Object.entries(data as Record<string, unknown>)
+      entries.forEach(([key, value], i) => {
+        result += `${prefix}  "${key}": `
+        if (typeof value === 'string') {
+          result += `"${value}"`
+        } else if (typeof value === 'number' || typeof value === 'boolean') {
+          result += String(value)
+        } else if (value === null) {
+          result += 'null'
+        } else {
+          result += renderTree(value, indent + 1)
+        }
+        if (i < entries.length - 1) result += ','
+        result += '\n'
+      })
+      result += `${prefix}}`
+    } else if (typeof data === 'string') {
+      result += `"${data}"`
+    } else {
+      result += String(data)
+    }
+
+    return result
+  }
+
+  function generateSimpleSchema(data: unknown): Record<string, unknown> {
+    if (data === null || data === undefined) {
+      return { type: 'string', title: 'Value' }
+    }
+
+    // For arrays, always use textarea to avoid json-editor issues
+    if (Array.isArray(data)) {
+      return {
+        type: 'string',
+        title: 'Array (JSON)',
+        format: 'textarea',
+      }
+    }
+
+    // For objects
+    if (typeof data === 'object') {
+      const entries = Object.entries(data as Record<string, unknown>)
+
+      // If too many properties, use textarea for the whole object
+      if (entries.length > 15) {
+        return {
+          type: 'string',
+          title: 'Object (JSON)',
+          format: 'textarea',
+        }
+      }
+
+      const properties: Record<string, unknown> = {}
+      for (const [key, value] of entries) {
+        if (value === null || value === undefined) {
+          properties[key] = { type: 'string', title: key }
+        } else if (Array.isArray(value) || (typeof value === 'object' && Object.keys(value as object).length > 5)) {
+          // Arrays and complex objects become textarea
+          properties[key] = {
+            type: 'string',
+            title: key,
+            format: 'textarea',
+          }
+        } else {
+          properties[key] = {
+            type: typeof value === 'number' ? 'number' : typeof value === 'boolean' ? 'boolean' : 'string',
+            title: key,
+          }
+        }
+      }
+      return { type: 'object', properties }
+    }
+
+    return { type: typeof data === 'number' ? 'number' : typeof data === 'boolean' ? 'boolean' : 'string' }
+  }
 
   async function loadConfig() {
     try {
@@ -81,9 +195,7 @@ function App() {
       if (config.scanPaths[0]) {
         scanDirectory(config.scanPaths[0])
       }
-    } catch {
-      // No config yet
-    }
+    } catch {}
   }
 
   async function scanDirectory(path: string) {
@@ -105,40 +217,6 @@ function App() {
       map.set(d.type, list)
     })
     return Array.from(map.entries()).map(([name, devices]) => ({ name, devices }))
-  }
-
-  function generateSchema(data: unknown, depth = 0): Record<string, unknown> {
-    if (depth > 5) return { type: 'string', title: 'Value', format: 'textarea' }
-
-    if (Array.isArray(data)) {
-      if (data.length === 0) {
-        return { type: 'array', items: { type: 'string' } }
-      }
-      return {
-        type: 'array',
-        items: generateSchema(data[0], depth + 1),
-      }
-    }
-
-    if (data !== null && typeof data === 'object') {
-      const properties: Record<string, unknown> = {}
-      for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
-        properties[key] = generateSchema(value, depth + 1)
-      }
-      return { type: 'object', properties }
-    }
-
-    if (typeof data === 'number') {
-      return Number.isInteger(data)
-        ? { type: 'integer', title: 'Value' }
-        : { type: 'number', title: 'Value' }
-    }
-
-    if (typeof data === 'boolean') {
-      return { type: 'boolean', title: 'Value' }
-    }
-
-    return { type: 'string', title: 'Value' }
   }
 
   async function saveDevice(filePath: string, data: Record<string, unknown>) {
@@ -257,10 +335,14 @@ function App() {
   return (
     <div className="app">
       <header className="header">
-        <h1>JSON Config Editor</h1>
         <div className="toolbar">
-          <button onClick={handleSelectFolder}>📁 扫描文件夹</button>
-          <button onClick={handleOpenFile}>📄 打开文件</button>
+          <h1>JSON Editor</h1>
+          <button className="btn-primary" onClick={handleSelectFolder}>
+            📁 扫描文件夹
+          </button>
+          <button className="btn-primary" onClick={handleOpenFile}>
+            📄 打开文件
+          </button>
           <div className="url-input">
             <input
               type="text"
@@ -269,57 +351,73 @@ function App() {
               onChange={e => setUrlInput(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && handleFetchUrl()}
             />
-            <button onClick={handleFetchUrl} disabled={loading}>
+            <button className="btn-accent" onClick={handleFetchUrl} disabled={loading}>
               {loading ? '⏳' : '🔗'} 解析
             </button>
           </div>
-          <input
-            type="text"
-            placeholder="搜索..."
-            value={searchQuery}
-            onChange={e => setSearchQuery(e.target.value)}
-          />
+          <div className="search-box">
+            <span>🔍</span>
+            <input
+              type="text"
+              placeholder="搜索..."
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+            />
+          </div>
         </div>
       </header>
 
       {error && (
         <div className="error-bar">
-          <span>{error}</span>
-          <button onClick={() => setError(null)}>✕</button>
+          <span className="error-icon">⚠️</span>
+          <span className="error-text">{error}</span>
+          <button className="error-close" onClick={() => setError(null)}>✕</button>
         </div>
       )}
 
       <div className="main">
         <aside className="sidebar">
-          {filteredCategories.map(cat => (
-            <div key={cat.name} className="category">
-              <h3>{cat.name}</h3>
-              <ul>
-                {cat.devices.map(device => (
-                  <li
-                    key={device.id}
-                    className={selectedDevice?.id === device.id ? 'active' : ''}
-                    onClick={() => {
-                      setSelectedDevice(device)
-                      setError(null)
-                      setViewMode('form')
-                    }}
-                  >
-                    {device.name}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))}
+          <div className="sidebar-header">
+            <h2>设备列表</h2>
+            <span className="count-badge">{filteredCategories.reduce((acc, cat) => acc + cat.devices.length, 0)}</span>
+          </div>
+          <div className="sidebar-content">
+            {filteredCategories.map(cat => (
+              <div key={cat.name} className="category">
+                <div className="category-header">
+                  <span className="category-icon">📁</span>
+                  <h3>{cat.name}</h3>
+                  <span className="category-count">{cat.devices.length}</span>
+                </div>
+                <ul>
+                  {cat.devices.map(device => (
+                    <li
+                      key={device.id}
+                      className={selectedDevice?.id === device.id ? 'active' : ''}
+                      onClick={() => {
+                        setSelectedDevice(device)
+                        setError(null)
+                        setViewMode('form')
+                      }}
+                    >
+                      <span className="device-icon">📋</span>
+                      <span className="device-name">{device.name}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
         </aside>
 
         <main className="editor-panel">
           {selectedDevice ? (
             <>
               <div className="editor-header">
-                <h2>{selectedDevice.name}</h2>
-                <span className="badge">{selectedDevice.type}</span>
-                <code className="path">{selectedDevice.filePath}</code>
+                <div className="editor-info">
+                  <h2>{selectedDevice.name}</h2>
+                  <span className="badge">{selectedDevice.type}</span>
+                </div>
                 <div className="header-actions">
                   <div className="view-toggle">
                     <button
@@ -334,30 +432,51 @@ function App() {
                     >
                       原始
                     </button>
+                    <button
+                      className={viewMode === 'tree' ? 'active' : ''}
+                      onClick={() => setViewMode('tree')}
+                    >
+                      树形
+                    </button>
                   </div>
-                  <button onClick={handleRefresh} title="刷新">🔄</button>
-                  <button onClick={handleExportJson}>导出JSON</button>
-                  <button onClick={handleExportCsv}>导出CSV</button>
+                  <button className="btn-icon-only" onClick={handleRefresh} title="刷新">🔄</button>
+                  <button className="btn-secondary" onClick={handleExportJson}>
+                    导出 JSON
+                  </button>
+                  <button className="btn-secondary" onClick={handleExportCsv}>
+                    导出 CSV
+                  </button>
                 </div>
               </div>
-              {viewMode === 'form' ? (
+              <code className="path-bar">{selectedDevice.filePath}</code>
+              {viewMode === 'form' && (
                 <div ref={editorRef} className="json-editor-container" />
-              ) : (
+              )}
+              {viewMode === 'raw' && (
                 <div className="raw-editor">
                   <textarea
                     value={rawJson}
                     onChange={e => setRawJson(e.target.value)}
                     spellCheck={false}
                   />
-                  <button className="raw-save-btn" onClick={handleRawSave}>
-                    保存修改
-                  </button>
+                  <div className="raw-actions">
+                    <button className="btn-primary" onClick={handleRawSave}>
+                      💾 保存修改
+                    </button>
+                  </div>
+                </div>
+              )}
+              {viewMode === 'tree' && (
+                <div className="tree-editor">
+                  <pre>{treeData}</pre>
                 </div>
               )}
             </>
           ) : (
             <div className="empty-state">
+              <div className="empty-icon">📝</div>
               <p>选择设备或打开JSON文件开始编辑</p>
+              <p className="empty-hint">支持本地文件和URL导入</p>
             </div>
           )}
         </main>
