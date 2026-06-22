@@ -1,4 +1,5 @@
 mod db;
+mod files;
 
 use rusqlite::Connection;
 use std::sync::Mutex;
@@ -31,14 +32,27 @@ pub fn run() {
             conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
 
             app.manage(db::DbState(Mutex::new(conn)));
+
+            let config = files::AppConfig {
+                scan_paths: Vec::new(),
+                last_open_path: String::new(),
+            };
+            app.manage(files::ConfigState(Mutex::new(config)));
+
             Ok(())
         })
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             db::init_db,
             db::add_item,
             db::get_items,
             db::delete_item,
+            files::scan_directory,
+            files::load_file,
+            files::save_device,
+            files::load_config,
+            files::save_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

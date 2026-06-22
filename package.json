@@ -11,7 +11,9 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@json-editor/json-editor": "^2.17.1",
     "@tauri-apps/api": "^2.11.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
   },
