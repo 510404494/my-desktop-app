@@ -1,9 +1,11 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import JSONEditor from '@json-editor/json-editor'
 import type { DeviceConfig, DeviceCategory } from './types'
 import './App.css'
+
+type ViewMode = 'form' | 'raw'
 
 function App() {
   const [categories, setCategories] = useState<DeviceCategory[]>([])
@@ -11,6 +13,9 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('')
   const [urlInput, setUrlInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [viewMode, setViewMode] = useState<ViewMode>('form')
+  const [rawJson, setRawJson] = useState('')
   const editorRef = useRef<HTMLDivElement>(null)
   const editorInstance = useRef<JSONEditor | null>(null)
 
@@ -18,35 +23,57 @@ function App() {
     loadConfig()
   }, [])
 
+  const destroyEditor = useCallback(() => {
+    if (editorInstance.current) {
+      try {
+        editorInstance.current.destroy()
+      } catch {}
+      editorInstance.current = null
+    }
+  }, [])
+
   useEffect(() => {
-    if (selectedDevice && editorRef.current) {
-      if (editorInstance.current) {
-        editorInstance.current.destroy()
+    if (selectedDevice && editorRef.current && viewMode === 'form') {
+      destroyEditor()
+
+      try {
+        const schema = generateSchema(selectedDevice.data)
+
+        editorInstance.current = new JSONEditor(editorRef.current, {
+          schema,
+          startval: selectedDevice.data,
+          theme: 'bootstrap4',
+          iconlib: 'fontawesome5',
+          compact: true,
+          disable_edit_json: true,
+          disable_properties: true,
+          disable_array_reorder: true,
+        })
+
+        editorInstance.current.on('change', () => {
+          if (editorInstance.current && selectedDevice) {
+            try {
+              const newData = editorInstance.current.getValue()
+              saveDevice(selectedDevice.filePath, newData)
+            } catch (err) {
+              console.error('Auto-save failed:', err)
+            }
+          }
+        })
+      } catch (err) {
+        console.error('Editor init failed:', err)
+        setError('表单渲染失败，已切换到原始编辑模式')
+        setViewMode('raw')
+        setRawJson(JSON.stringify(selectedDevice.data, null, 2))
       }
-
-      editorInstance.current = new JSONEditor(editorRef.current, {
-        schema: generateSchema(selectedDevice.data),
-        startval: selectedDevice.data,
-        theme: 'bootstrap4',
-        iconlib: 'fontawesome5',
-        compact: true,
-      })
-
-      editorInstance.current.on('change', () => {
-        if (editorInstance.current && selectedDevice) {
-          const newData = editorInstance.current.getValue()
-          saveDevice(selectedDevice.filePath, newData)
-        }
-      })
     }
 
-    return () => {
-      if (editorInstance.current) {
-        editorInstance.current.destroy()
-        editorInstance.current = null
-      }
+    if (viewMode === 'raw' && selectedDevice) {
+      setRawJson(JSON.stringify(selectedDevice.data, null, 2))
     }
-  }, [selectedDevice])
+
+    return () => destroyEditor()
+  }, [selectedDevice, viewMode, destroyEditor])
 
   async function loadConfig() {
     try {
@@ -55,7 +82,7 @@ function App() {
         scanDirectory(config.scanPaths[0])
       }
     } catch {
-      console.log('No config found')
+      // No config yet
     }
   }
 
@@ -66,7 +93,7 @@ function App() {
       setCategories(grouped)
       await invoke('save_config', { scanPaths: [path] })
     } catch (err) {
-      console.error('Scan failed:', err)
+      setError(`扫描失败: ${err}`)
     }
   }
 
@@ -80,24 +107,38 @@ function App() {
     return Array.from(map.entries()).map(([name, devices]) => ({ name, devices }))
   }
 
-  function generateSchema(data: Record<string, unknown>) {
-    const properties: Record<string, unknown> = {}
-    Object.keys(data).forEach(key => {
-      const value = data[key]
-      if (typeof value === 'string') {
-        properties[key] = { type: 'string', title: key }
-      } else if (typeof value === 'number') {
-        properties[key] = { type: 'number', title: key }
-      } else if (typeof value === 'boolean') {
-        properties[key] = { type: 'boolean', title: key }
-      } else {
-        properties[key] = { type: 'string', title: key, format: 'textarea' }
+  function generateSchema(data: unknown, depth = 0): Record<string, unknown> {
+    if (depth > 5) return { type: 'string', title: 'Value', format: 'textarea' }
+
+    if (Array.isArray(data)) {
+      if (data.length === 0) {
+        return { type: 'array', items: { type: 'string' } }
       }
-    })
-    return {
-      type: 'object',
-      properties,
+      return {
+        type: 'array',
+        items: generateSchema(data[0], depth + 1),
+      }
     }
+
+    if (data !== null && typeof data === 'object') {
+      const properties: Record<string, unknown> = {}
+      for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+        properties[key] = generateSchema(value, depth + 1)
+      }
+      return { type: 'object', properties }
+    }
+
+    if (typeof data === 'number') {
+      return Number.isInteger(data)
+        ? { type: 'integer', title: 'Value' }
+        : { type: 'number', title: 'Value' }
+    }
+
+    if (typeof data === 'boolean') {
+      return { type: 'boolean', title: 'Value' }
+    }
+
+    return { type: 'string', title: 'Value' }
   }
 
   async function saveDevice(filePath: string, data: Record<string, unknown>) {
@@ -122,10 +163,12 @@ function App() {
     })
     if (selected) {
       try {
+        setError(null)
         const device = await invoke<DeviceConfig>('load_file', { path: selected })
         setSelectedDevice(device)
+        setViewMode('form')
       } catch (err) {
-        console.error('Load failed:', err)
+        setError(`打开文件失败: ${err}`)
       }
     }
   }
@@ -133,19 +176,21 @@ function App() {
   async function handleFetchUrl() {
     if (!urlInput.trim()) return
     setLoading(true)
+    setError(null)
     try {
       const data = await invoke<Record<string, unknown>>('fetch_json_from_url', { url: urlInput })
+      const name = urlInput.split('/').pop()?.split('?')[0] || 'URL Import'
       const device: DeviceConfig = {
         id: crypto.randomUUID(),
-        name: 'URL Import',
+        name,
         type: 'url',
         filePath: urlInput,
         data,
       }
       setSelectedDevice(device)
+      setViewMode('form')
     } catch (err) {
-      console.error('Fetch failed:', err)
-      alert('Failed to fetch JSON from URL')
+      setError(`获取URL失败: ${err}`)
     } finally {
       setLoading(false)
     }
@@ -153,23 +198,51 @@ function App() {
 
   async function handleExportJson() {
     if (!selectedDevice) return
-    const path = await save({
-      filters: [{ name: 'JSON', extensions: ['json'] }],
-      defaultPath: `${selectedDevice.name}.json`,
-    })
-    if (path) {
-      await invoke('export_to_json', { data: selectedDevice.data, path })
+    try {
+      const path = await save({
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+        defaultPath: `${selectedDevice.name}.json`,
+      })
+      if (path) {
+        await invoke('export_to_json', { data: selectedDevice.data, path })
+      }
+    } catch (err) {
+      setError(`导出失败: ${err}`)
     }
   }
 
   async function handleExportCsv() {
     if (!selectedDevice) return
-    const path = await save({
-      filters: [{ name: 'CSV', extensions: ['csv'] }],
-      defaultPath: `${selectedDevice.name}.csv`,
-    })
-    if (path) {
-      await invoke('export_to_csv', { data: selectedDevice.data, path })
+    try {
+      const path = await save({
+        filters: [{ name: 'CSV', extensions: ['csv'] }],
+        defaultPath: `${selectedDevice.name}.csv`,
+      })
+      if (path) {
+        await invoke('export_to_csv', { data: selectedDevice.data, path })
+      }
+    } catch (err) {
+      setError(`导出失败: ${err}`)
+    }
+  }
+
+  function handleRefresh() {
+    setError(null)
+    setViewMode('form')
+    if (selectedDevice) {
+      setSelectedDevice({ ...selectedDevice })
+    }
+  }
+
+  function handleRawSave() {
+    if (!selectedDevice) return
+    try {
+      const data = JSON.parse(rawJson)
+      setSelectedDevice({ ...selectedDevice, data })
+      saveDevice(selectedDevice.filePath, data)
+      setError(null)
+    } catch (err) {
+      setError(`JSON格式错误: ${err}`)
     }
   }
 
@@ -209,6 +282,13 @@ function App() {
         </div>
       </header>
 
+      {error && (
+        <div className="error-bar">
+          <span>{error}</span>
+          <button onClick={() => setError(null)}>✕</button>
+        </div>
+      )}
+
       <div className="main">
         <aside className="sidebar">
           {filteredCategories.map(cat => (
@@ -219,7 +299,11 @@ function App() {
                   <li
                     key={device.id}
                     className={selectedDevice?.id === device.id ? 'active' : ''}
-                    onClick={() => setSelectedDevice(device)}
+                    onClick={() => {
+                      setSelectedDevice(device)
+                      setError(null)
+                      setViewMode('form')
+                    }}
                   >
                     {device.name}
                   </li>
@@ -236,12 +320,40 @@ function App() {
                 <h2>{selectedDevice.name}</h2>
                 <span className="badge">{selectedDevice.type}</span>
                 <code className="path">{selectedDevice.filePath}</code>
-                <div className="export-buttons">
+                <div className="header-actions">
+                  <div className="view-toggle">
+                    <button
+                      className={viewMode === 'form' ? 'active' : ''}
+                      onClick={() => setViewMode('form')}
+                    >
+                      表单
+                    </button>
+                    <button
+                      className={viewMode === 'raw' ? 'active' : ''}
+                      onClick={() => setViewMode('raw')}
+                    >
+                      原始
+                    </button>
+                  </div>
+                  <button onClick={handleRefresh} title="刷新">🔄</button>
                   <button onClick={handleExportJson}>导出JSON</button>
                   <button onClick={handleExportCsv}>导出CSV</button>
                 </div>
               </div>
-              <div ref={editorRef} className="json-editor-container" />
+              {viewMode === 'form' ? (
+                <div ref={editorRef} className="json-editor-container" />
+              ) : (
+                <div className="raw-editor">
+                  <textarea
+                    value={rawJson}
+                    onChange={e => setRawJson(e.target.value)}
+                    spellCheck={false}
+                  />
+                  <button className="raw-save-btn" onClick={handleRawSave}>
+                    保存修改
+                  </button>
+                </div>
+              )}
             </>
           ) : (
             <div className="empty-state">

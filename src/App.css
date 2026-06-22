@@ -143,13 +143,35 @@ body {
   font-weight: 500;
 }
 
-.export-buttons {
+.header-actions {
   margin-left: auto;
   display: flex;
   gap: 8px;
+  align-items: center;
 }
 
-.export-buttons button {
+.view-toggle {
+  display: flex;
+  background: #3c3c3c;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.view-toggle button {
+  padding: 4px 12px;
+  background: transparent;
+  color: #888;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.view-toggle button.active {
+  background: #0e639c;
+  color: #fff;
+}
+
+.header-actions button {
   padding: 4px 10px;
   background: #3c3c3c;
   color: #d4d4d4;
@@ -159,8 +181,66 @@ body {
   font-size: 12px;
 }
 
-.export-buttons button:hover {
+.header-actions button:hover {
   background: #4c4c4c;
+}
+
+.raw-editor {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 16px 20px;
+}
+
+.raw-editor textarea {
+  flex: 1;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  border: 1px solid #3c3c3c;
+  border-radius: 4px;
+  padding: 12px;
+  font-family: 'SF Mono', Monaco, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: none;
+}
+
+.raw-editor textarea:focus {
+  outline: none;
+  border-color: #007acc;
+}
+
+.raw-save-btn {
+  margin-top: 8px;
+  padding: 8px 16px;
+  background: #0e639c;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  align-self: flex-end;
+}
+
+.raw-save-btn:hover {
+  background: #1177bb;
+}
+
+.error-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 20px;
+  background: #5a1d1d;
+  color: #f48771;
+  font-size: 13px;
+}
+
+.error-bar button {
+  background: transparent;
+  color: #f48771;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
 }
 
 .badge {
