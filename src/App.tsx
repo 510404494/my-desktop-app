@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { open } from '@tauri-apps/plugin-dialog'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import JSONEditor from '@json-editor/json-editor'
 import type { DeviceConfig, DeviceCategory } from './types'
 import './App.css'
@@ -9,6 +9,8 @@ function App() {
   const [categories, setCategories] = useState<DeviceCategory[]>([])
   const [selectedDevice, setSelectedDevice] = useState<DeviceConfig | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
+  const [urlInput, setUrlInput] = useState('')
+  const [loading, setLoading] = useState(false)
   const editorRef = useRef<HTMLDivElement>(null)
   const editorInstance = useRef<JSONEditor | null>(null)
 
@@ -128,6 +130,49 @@ function App() {
     }
   }
 
+  async function handleFetchUrl() {
+    if (!urlInput.trim()) return
+    setLoading(true)
+    try {
+      const data = await invoke<Record<string, unknown>>('fetch_json_from_url', { url: urlInput })
+      const device: DeviceConfig = {
+        id: crypto.randomUUID(),
+        name: 'URL Import',
+        type: 'url',
+        filePath: urlInput,
+        data,
+      }
+      setSelectedDevice(device)
+    } catch (err) {
+      console.error('Fetch failed:', err)
+      alert('Failed to fetch JSON from URL')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleExportJson() {
+    if (!selectedDevice) return
+    const path = await save({
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+      defaultPath: `${selectedDevice.name}.json`,
+    })
+    if (path) {
+      await invoke('export_to_json', { data: selectedDevice.data, path })
+    }
+  }
+
+  async function handleExportCsv() {
+    if (!selectedDevice) return
+    const path = await save({
+      filters: [{ name: 'CSV', extensions: ['csv'] }],
+      defaultPath: `${selectedDevice.name}.csv`,
+    })
+    if (path) {
+      await invoke('export_to_csv', { data: selectedDevice.data, path })
+    }
+  }
+
   const filteredCategories = categories.map(cat => ({
     ...cat,
     devices: cat.devices.filter(d =>
@@ -143,6 +188,18 @@ function App() {
         <div className="toolbar">
           <button onClick={handleSelectFolder}>📁 扫描文件夹</button>
           <button onClick={handleOpenFile}>📄 打开文件</button>
+          <div className="url-input">
+            <input
+              type="text"
+              placeholder="输入JSON URL..."
+              value={urlInput}
+              onChange={e => setUrlInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && handleFetchUrl()}
+            />
+            <button onClick={handleFetchUrl} disabled={loading}>
+              {loading ? '⏳' : '🔗'} 解析
+            </button>
+          </div>
           <input
             type="text"
             placeholder="搜索..."
@@ -179,6 +236,10 @@ function App() {
                 <h2>{selectedDevice.name}</h2>
                 <span className="badge">{selectedDevice.type}</span>
                 <code className="path">{selectedDevice.filePath}</code>
+                <div className="export-buttons">
+                  <button onClick={handleExportJson}>导出JSON</button>
+                  <button onClick={handleExportCsv}>导出CSV</button>
+                </div>
               </div>
               <div ref={editorRef} className="json-editor-container" />
             </>

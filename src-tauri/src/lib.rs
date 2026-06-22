@@ -53,6 +53,9 @@ pub fn run() {
             files::save_device,
             files::load_config,
             files::save_config,
+            files::fetch_json_from_url,
+            files::export_to_json,
+            files::export_to_csv,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

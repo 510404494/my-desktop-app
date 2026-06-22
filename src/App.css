@@ -51,6 +51,20 @@ body {
   background: #1177bb;
 }
 
+.toolbar button:disabled {
+  background: #555;
+  cursor: not-allowed;
+}
+
+.url-input {
+  display: flex;
+  gap: 4px;
+}
+
+.url-input input {
+  width: 300px;
+}
+
 .toolbar input {
   padding: 6px 12px;
   background: #3c3c3c;
@@ -127,6 +141,26 @@ body {
 .editor-header h2 {
   font-size: 14px;
   font-weight: 500;
+}
+
+.export-buttons {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+.export-buttons button {
+  padding: 4px 10px;
+  background: #3c3c3c;
+  color: #d4d4d4;
+  border: 1px solid #555;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.export-buttons button:hover {
+  background: #4c4c4c;
 }
 
 .badge {

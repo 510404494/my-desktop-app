@@ -26,6 +26,51 @@ pub struct AppConfig {
 pub struct ConfigState(pub Mutex<AppConfig>);
 
 #[tauri::command]
+pub async fn fetch_json_from_url(url: String) -> Result<serde_json::Value, String> {
+    let response = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    serde_json::from_str(&text)
+        .map_err(|e| format!("Failed to parse JSON: {}", e))
+}
+
+#[tauri::command]
+pub fn export_to_json(data: serde_json::Value, path: String) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
+    fs::write(&path, content).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn export_to_csv(data: serde_json::Value, path: String) -> Result<(), String> {
+    let mut csv = String::new();
+
+    if let Some(obj) = data.as_object() {
+        let keys: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
+        csv.push_str(&keys.join(","));
+        csv.push('\n');
+
+        let values: Vec<String> = keys.iter().map(|k| {
+            match obj.get(*k) {
+                Some(serde_json::Value::String(s)) => format!("\"{}\"", s.replace('"', "\"\"")),
+                Some(v) => v.to_string(),
+                None => String::new(),
+            }
+        }).collect();
+        csv.push_str(&values.join(","));
+    }
+
+    fs::write(&path, csv).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 pub fn scan_directory(path: String) -> Result<Vec<DeviceConfig>, String> {
     let dir = Path::new(&path);
     if !dir.is_dir() {
