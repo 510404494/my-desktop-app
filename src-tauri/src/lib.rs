@@ -33,6 +33,7 @@ pub fn run() {
             app.manage(db::DbState(Mutex::new(conn)));
             Ok(())
         })
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             db::init_db,
             db::add_item,
