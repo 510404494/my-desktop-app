@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 use tauri::State;
+use tempfile::NamedTempFile;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceConfig {
@@ -159,4 +161,278 @@ pub fn save_config(state: State<ConfigState>, scan_paths: Vec<String>) -> Result
     let mut config = state.0.lock().map_err(|e| e.to_string())?;
     config.scan_paths = scan_paths;
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerFile {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub modified: String,
+    pub is_dir: bool,
+}
+
+fn clean_ansi_escape(s: &str) -> String {
+    let re = regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").unwrap();
+    re.replace_all(s, "").to_string()
+}
+
+fn execute_jumpserver_command(host: &str, port: i64, username: &str, password: &str, host_choice: &str, cmd: &str) -> Result<String, String> {
+    let expect_script = format!(
+        "set timeout 30\n\
+         spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa {}@{} -p {}\n\
+         expect \"*password:*\"\n\
+         send \"{}\\n\"\n\
+         expect {{\n\
+             \"Opt>\" {{\n\
+                 send \"{}\\n\"\n\
+             }}\n\
+             \"*欢迎*\" {{\n\
+                 send \"{}\\n\"\n\
+                 expect \"Opt>\"\n\
+                 send \"{}\\n\"\n\
+             }}\n\
+         }}\n\
+         expect {{\n\
+             \"~]$\" {{}}\n\
+             \"bash-*\" {{}}\n\
+             \"[root@*\" {{}}\n\
+             \"*@* ~]$\" {{}}\n\
+         }}\n\
+         send \"cd /data/apppic/newsmarthome\\n\"\n\
+         expect {{\n\
+             \"~]$\" {{}}\n\
+             \"bash-*\" {{}}\n\
+             \"[root@*\" {{}}\n\
+             \"*@* ~]$\" {{}}\n\
+         }}\n\
+         send \"{}\\n\"\n\
+         expect {{\n\
+             \"~]$\" {{}}\n\
+             \"bash-*\" {{}}\n\
+             \"[root@*\" {{}}\n\
+             \"*@* ~]$\" {{}}\n\
+         }}\n\
+         send \"exit\\n\"\n\
+         expect eof",
+        username, host, port, password, host_choice, host_choice, host_choice, cmd
+    );
+    
+    let temp_file = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+    
+    fs::write(temp_file.path(), expect_script)
+        .map_err(|e| format!("Failed to write expect script: {}", e))?;
+    
+    let output = std::process::Command::new("expect")
+        .arg(temp_file.path())
+        .output()
+        .map_err(|e| format!("Failed to execute expect: {}", e))?;
+    
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    
+    if !output.status.success() {
+        return Err(format!("Command failed: {}", stderr));
+    }
+    
+    let combined = format!("{}\n{}", stdout, stderr);
+    let cleaned = clean_ansi_escape(&combined);
+    
+    Ok(cleaned)
+}
+
+#[tauri::command]
+pub fn list_server_files(
+    host: String,
+    port: i64,
+    username: String,
+    password: String,
+    remotePath: String,
+) -> Result<Vec<ServerFile>, String> {
+    let cmd = format!("ls -la {}", remotePath);
+    let output = execute_jumpserver_command(&host, port, &username, &password, "1", &cmd)?;
+    
+    let mut files = Vec::new();
+    let mut in_ls_output = false;
+    
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        
+        if !in_ls_output {
+            if trimmed.contains("Last login") || trimmed.starts_with("[dev@") || trimmed.starts_with("Opt") || trimmed.starts_with("欢迎") {
+                continue;
+            }
+            if trimmed.starts_with("$") || trimmed.starts_with("]") || trimmed.starts_with(">") {
+                continue;
+            }
+            if trimmed.starts_with("total") {
+                in_ls_output = true;
+                continue;
+            }
+            in_ls_output = true;
+        }
+        
+        if trimmed.starts_with("$") || trimmed.starts_with("]") || trimmed.starts_with(">") {
+            continue;
+        }
+        
+        if trimmed.starts_with("total") {
+            continue;
+        }
+        
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() < 9 {
+            continue;
+        }
+        
+        let permissions = parts[0];
+        let is_dir = permissions.starts_with('d');
+        let size: u64 = parts[4].parse().unwrap_or(0);
+        let name_start = parts[0..8].join(" ").len() + 1;
+        let name = &trimmed[name_start..].trim();
+        
+        if name.starts_with('.') {
+            continue;
+        }
+        
+        if !is_dir {
+            let lower_name = name.to_lowercase();
+            if !lower_name.ends_with(".png") && !lower_name.ends_with(".jpg") && !lower_name.ends_with(".jpeg") {
+                continue;
+            }
+        }
+        
+        files.push(ServerFile {
+            name: name.to_string(),
+            path: format!("{}/{}", remotePath, name),
+            size,
+            modified: String::new(),
+            is_dir,
+        });
+    }
+    
+    files.sort_by(|a, b| {
+        if a.is_dir != b.is_dir {
+            a.is_dir.cmp(&b.is_dir).reverse()
+        } else {
+            a.name.cmp(&b.name)
+        }
+    });
+    
+    Ok(files)
+}
+
+#[tauri::command]
+pub fn download_server_file(
+    host: String,
+    port: i64,
+    username: String,
+    password: String,
+    remotePath: String,
+) -> Result<String, String> {
+    let cmd = format!("cat {}", remotePath);
+    let content = execute_jumpserver_command(&host, port, &username, &password, "1", &cmd)?;
+    
+    let mut temp_file = NamedTempFile::new()
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+    
+    temp_file.write_all(content.as_bytes())
+        .map_err(|e| format!("Failed to write temp file: {}", e))?;
+    
+    let temp_path = temp_file.into_temp_path();
+    let path_str = temp_path.to_string_lossy().to_string();
+    
+    Ok(path_str)
+}
+
+#[tauri::command]
+pub fn read_server_file(
+    host: String,
+    port: i64,
+    username: String,
+    password: String,
+    remotePath: String,
+) -> Result<String, String> {
+    let cmd = format!("cat {}", remotePath);
+    let output = execute_jumpserver_command(&host, port, &username, &password, "1", &cmd)?;
+    
+    let mut content = String::new();
+    let mut in_content = false;
+    
+    for line in output.lines() {
+        let trimmed = line.trim();
+        
+        if trimmed.starts_with("~]$") || trimmed.starts_with("Opt>") || trimmed.starts_with("[dev@") {
+            in_content = false;
+            continue;
+        }
+        
+        if trimmed.starts_with("wangchuan") || trimmed.contains("欢迎使用") || trimmed.contains("Last login") {
+            continue;
+        }
+        
+        if !in_content && trimmed.is_empty() {
+            continue;
+        }
+        
+        in_content = true;
+        content.push_str(line);
+        content.push('\n');
+    }
+    
+    Ok(content.trim().to_string())
+}
+
+#[tauri::command]
+pub fn execute_jumpserver_cmd(
+    host: String,
+    port: i64,
+    username: String,
+    password: String,
+    command: String,
+) -> Result<String, String> {
+    let output = execute_jumpserver_command(&host, port, &username, &password, "1", &command)?;
+    
+    let mut content = String::new();
+    let mut in_content = false;
+    
+    for line in output.lines() {
+        let trimmed = line.trim();
+        
+        if trimmed.starts_with("~]$") || trimmed.starts_with("Opt>") || trimmed.starts_with("[dev@") {
+            in_content = false;
+            continue;
+        }
+        
+        if trimmed.starts_with("wangchuan") || trimmed.contains("欢迎使用") || trimmed.contains("Last login") {
+            continue;
+        }
+        
+        if !in_content && trimmed.is_empty() {
+            continue;
+        }
+        
+        in_content = true;
+        content.push_str(line);
+        content.push('\n');
+    }
+    
+    Ok(content.trim().to_string())
+}
+
+#[tauri::command]
+pub fn test_server_connection(
+    host: String,
+    port: i64,
+    username: String,
+    password: String,
+) -> Result<String, String> {
+    let cmd = "echo \"Connection successful\"";
+    let _output = execute_jumpserver_command(&host, port, &username, &password, "1", &cmd)?;
+    
+    Ok("连接成功！".to_string())
 }

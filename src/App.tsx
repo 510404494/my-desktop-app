@@ -1,11 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke, isTauri } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import JSONEditor from '@json-editor/json-editor'
 import type { DeviceConfig, DeviceCategory } from './types'
+import PicNav from './components/ImageNav'
 import './App.css'
 
 type ViewMode = 'form' | 'raw' | 'tree'
+type PageMode = 'json' | 'images'
 
 function App() {
   const [categories, setCategories] = useState<DeviceCategory[]>([])
@@ -17,12 +19,25 @@ function App() {
   const [viewMode, setViewMode] = useState<ViewMode>('form')
   const [rawJson, setRawJson] = useState('')
   const [treeData, setTreeData] = useState<string>('')
+  const [pageMode, setPageMode] = useState<PageMode>('json')
   const editorRef = useRef<HTMLDivElement>(null)
   const editorInstance = useRef<JSONEditor | null>(null)
 
+  const [scanPathInput, setScanPathInput] = useState('')
+  const [scanResult, setScanResult] = useState<{ success: boolean; message: string; count?: number } | null>(null)
+  const [scanLoading, setScanLoading] = useState(false)
+
   useEffect(() => {
+    initDatabase()
     loadConfig()
   }, [])
+
+  async function initDatabase() {
+    if (!isTauri()) return
+    try {
+      await invoke('init_db')
+    } catch {}
+  }
 
   const destroyEditor = useCallback(() => {
     if (editorInstance.current) {
@@ -36,13 +51,6 @@ function App() {
   useEffect(() => {
     if (selectedDevice && editorRef.current && viewMode === 'form') {
       destroyEditor()
-
-      // Check if JSON is too complex for form view - silently switch to raw
-      if (isComplexJson(selectedDevice.data)) {
-        setViewMode('raw')
-        setRawJson(JSON.stringify(selectedDevice.data, null, 2))
-        return
-      }
 
       try {
         const schema = generateSimpleSchema(selectedDevice.data)
@@ -67,8 +75,7 @@ function App() {
         })
       } catch (err) {
         console.error('Editor init failed:', err)
-        setViewMode('raw')
-        setRawJson(JSON.stringify(selectedDevice.data, null, 2))
+        setError('表单渲染失败，请使用原始模式编辑')
       }
     }
 
@@ -143,7 +150,6 @@ function App() {
       return { type: 'string', title: 'Value' }
     }
 
-    // For arrays, always use textarea to avoid json-editor issues
     if (Array.isArray(data)) {
       return {
         type: 'string',
@@ -152,11 +158,9 @@ function App() {
       }
     }
 
-    // For objects
     if (typeof data === 'object') {
       const entries = Object.entries(data as Record<string, unknown>)
 
-      // If too many properties, use textarea for the whole object
       if (entries.length > 15) {
         return {
           type: 'string',
@@ -170,7 +174,6 @@ function App() {
         if (value === null || value === undefined) {
           properties[key] = { type: 'string', title: key }
         } else if (Array.isArray(value) || (typeof value === 'object' && Object.keys(value as object).length > 5)) {
-          // Arrays and complex objects become textarea
           properties[key] = {
             type: 'string',
             title: key,
@@ -244,7 +247,7 @@ function App() {
         setError(null)
         const device = await invoke<DeviceConfig>('load_file', { path: selected })
         setSelectedDevice(device)
-        setViewMode('form')
+        setViewMode(isComplexJson(device.data) ? 'raw' : 'form')
       } catch (err) {
         setError(`打开文件失败: ${err}`)
       }
@@ -257,7 +260,8 @@ function App() {
     setError(null)
     try {
       const data = await invoke<Record<string, unknown>>('fetch_json_from_url', { url: urlInput })
-      const name = urlInput.split('/').pop()?.split('?')[0] || 'URL Import'
+      const fileName = urlInput.split('/').pop()?.split('?')[0] || 'URL Import'
+      const name = fileName.replace(/\.json$/i, '') || 'URL Import'
       const device: DeviceConfig = {
         id: crypto.randomUUID(),
         name,
@@ -266,7 +270,7 @@ function App() {
         data,
       }
       setSelectedDevice(device)
-      setViewMode('form')
+      setViewMode(isComplexJson(data) ? 'raw' : 'form')
     } catch (err) {
       setError(`获取URL失败: ${err}`)
     } finally {
@@ -324,6 +328,34 @@ function App() {
     }
   }
 
+  async function testScan() {
+    if (!isTauri) {
+      setScanResult({ success: false, message: '请在 Tauri 桌面应用中运行此功能' })
+      return
+    }
+
+    if (!scanPathInput.trim()) {
+      setScanResult({ success: false, message: '请输入扫描路径' })
+      return
+    }
+
+    setScanLoading(true)
+    setScanResult(null)
+
+    try {
+      const devices = await invoke<DeviceConfig[]>('scan_directory', { path: scanPathInput })
+      setScanResult({
+        success: true,
+        message: `扫描成功！共发现 ${devices.length} 个 JSON 文件`,
+        count: devices.length,
+      })
+    } catch (err) {
+      setScanResult({ success: false, message: `扫描失败: ${err}` })
+    } finally {
+      setScanLoading(false)
+    }
+  }
+
   const filteredCategories = categories.map(cat => ({
     ...cat,
     devices: cat.devices.filter(d =>
@@ -337,33 +369,69 @@ function App() {
       <header className="header">
         <div className="toolbar">
           <h1>JSON Editor</h1>
-          <button className="btn-primary" onClick={handleSelectFolder}>
-            📁 扫描文件夹
-          </button>
-          <button className="btn-primary" onClick={handleOpenFile}>
-            📄 打开文件
-          </button>
-          <div className="url-input">
-            <input
-              type="text"
-              placeholder="输入JSON URL..."
-              value={urlInput}
-              onChange={e => setUrlInput(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && handleFetchUrl()}
-            />
-            <button className="btn-accent" onClick={handleFetchUrl} disabled={loading}>
-              {loading ? '⏳' : '🔗'} 解析
+          <nav className="nav-tabs">
+            <button
+              className={pageMode === 'json' ? 'active' : ''}
+              onClick={() => setPageMode('json')}
+            >
+              📄 JSON
             </button>
-          </div>
-          <div className="search-box">
-            <span>🔍</span>
-            <input
-              type="text"
-              placeholder="搜索..."
-              value={searchQuery}
-              onChange={e => setSearchQuery(e.target.value)}
-            />
-          </div>
+            <button
+              className={pageMode === 'images' ? 'active' : ''}
+              onClick={() => setPageMode('images')}
+            >
+              🖼️ 图片导航
+            </button>
+          </nav>
+          {pageMode === 'json' && (
+            <>
+              <button className="btn-primary" onClick={handleSelectFolder}>
+                📁 扫描文件夹
+              </button>
+              <div className="scan-path-input">
+                <input
+                  type="text"
+                  placeholder="输入扫描路径..."
+                  value={scanPathInput}
+                  onChange={e => setScanPathInput(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && testScan()}
+                />
+                <button className="btn-accent" onClick={testScan} disabled={scanLoading}>
+                  {scanLoading ? '⏳' : '🔍'} 测试扫描
+                </button>
+              </div>
+              {scanResult && (
+                <div className={`scan-result ${scanResult.success ? 'success' : 'error'}`}>
+                  <span className="result-icon">{scanResult.success ? '✓' : '✗'}</span>
+                  <span className="result-message">{scanResult.message}</span>
+                </div>
+              )}
+              <button className="btn-primary" onClick={handleOpenFile}>
+                📄 打开文件
+              </button>
+              <div className="url-input">
+                <input
+                  type="text"
+                  placeholder="输入JSON URL..."
+                  value={urlInput}
+                  onChange={e => setUrlInput(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleFetchUrl()}
+                />
+                <button className="btn-accent" onClick={handleFetchUrl} disabled={loading}>
+                  {loading ? '⏳' : '🔗'} 解析
+                </button>
+              </div>
+              <div className="search-box">
+                <span>🔍</span>
+                <input
+                  type="text"
+                  placeholder="搜索..."
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                />
+              </div>
+            </>
+          )}
         </div>
       </header>
 
@@ -376,112 +444,119 @@ function App() {
       )}
 
       <div className="main">
-        <aside className="sidebar">
-          <div className="sidebar-header">
-            <h2>设备列表</h2>
-            <span className="count-badge">{filteredCategories.reduce((acc, cat) => acc + cat.devices.length, 0)}</span>
-          </div>
-          <div className="sidebar-content">
-            {filteredCategories.map(cat => (
-              <div key={cat.name} className="category">
-                <div className="category-header">
-                  <span className="category-icon">📁</span>
-                  <h3>{cat.name}</h3>
-                  <span className="category-count">{cat.devices.length}</span>
-                </div>
-                <ul>
-                  {cat.devices.map(device => (
-                    <li
-                      key={device.id}
-                      className={selectedDevice?.id === device.id ? 'active' : ''}
-                      onClick={() => {
-                        setSelectedDevice(device)
-                        setError(null)
-                        setViewMode('form')
-                      }}
-                    >
-                      <span className="device-icon">📋</span>
-                      <span className="device-name">{device.name}</span>
-                    </li>
-                  ))}
-                </ul>
+        {pageMode === 'images' ? (
+          <PicNav />
+        ) : (
+          <>
+            <aside className="sidebar">
+              <div className="sidebar-header">
+                <h2>设备列表</h2>
+                <span className="count-badge">{filteredCategories.reduce((acc, cat) => acc + cat.devices.length, 0)}</span>
               </div>
-            ))}
-          </div>
-        </aside>
+              <div className="sidebar-content">
+                {filteredCategories.map(cat => (
+                  <div key={cat.name} className="category">
+                    <div className="category-header">
+                      <span className="category-icon">📁</span>
+                      <h3>{cat.name}</h3>
+                      <span className="category-count">{cat.devices.length}</span>
+                    </div>
+                    <ul>
+                      {cat.devices.map(device => (
+                        <li
+                          key={device.id}
+                          className={selectedDevice?.id === device.id ? 'active' : ''}
+                          onClick={() => {
+                            setSelectedDevice(device)
+                            setError(null)
+                            setViewMode(isComplexJson(device.data) ? 'raw' : 'form')
+                          }}
+                        >
+                          <span className="device-icon">📋</span>
+                          <span className="device-name">{device.name}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+            </aside>
 
-        <main className="editor-panel">
-          {selectedDevice ? (
-            <>
-              <div className="editor-header">
-                <div className="editor-info">
-                  <h2>{selectedDevice.name}</h2>
-                  <span className="badge">{selectedDevice.type}</span>
-                </div>
-                <div className="header-actions">
-                  <div className="view-toggle">
-                    <button
-                      className={viewMode === 'form' ? 'active' : ''}
-                      onClick={() => setViewMode('form')}
-                    >
-                      表单
-                    </button>
-                    <button
-                      className={viewMode === 'raw' ? 'active' : ''}
-                      onClick={() => setViewMode('raw')}
-                    >
-                      原始
-                    </button>
-                    <button
-                      className={viewMode === 'tree' ? 'active' : ''}
-                      onClick={() => setViewMode('tree')}
-                    >
-                      树形
-                    </button>
+            <main className="editor-panel">
+              {selectedDevice ? (
+                <>
+                  <div className="editor-header">
+                    <div className="editor-info">
+                      <h2>{selectedDevice.name}</h2>
+                      <span className="badge">{selectedDevice.type}</span>
+                    </div>
+                    <div className="header-actions">
+                      <div className="view-toggle">
+                        <button
+                          className={viewMode === 'form' ? 'active' : ''}
+                          onClick={() => setViewMode('form')}
+                        >
+                          表单
+                        </button>
+                        <button
+                          className={viewMode === 'raw' ? 'active' : ''}
+                          onClick={() => setViewMode('raw')}
+                        >
+                          原始
+                        </button>
+                        <button
+                          className={viewMode === 'tree' ? 'active' : ''}
+                          onClick={() => setViewMode('tree')}
+                        >
+                          树形
+                        </button>
+                      </div>
+                      <button className="btn-icon-only" onClick={handleRefresh} title="刷新">🔄</button>
+                      <button className="btn-secondary" onClick={handleExportJson}>
+                        导出 JSON
+                      </button>
+                      <button className="btn-secondary" onClick={handleExportCsv}>
+                        导出 CSV
+                      </button>
+                    </div>
                   </div>
-                  <button className="btn-icon-only" onClick={handleRefresh} title="刷新">🔄</button>
-                  <button className="btn-secondary" onClick={handleExportJson}>
-                    导出 JSON
-                  </button>
-                  <button className="btn-secondary" onClick={handleExportCsv}>
-                    导出 CSV
-                  </button>
+                  <code className="path-bar">{selectedDevice.filePath}</code>
+                  {viewMode === 'form' && (
+                    <div ref={editorRef} className="json-editor-container" />
+                  )}
+                  {viewMode === 'raw' && (
+                    <div className="raw-editor">
+                      <textarea
+                        value={rawJson}
+                        onChange={e => setRawJson(e.target.value)}
+                        spellCheck={false}
+                      />
+                      <div className="raw-actions">
+                        <button className="btn-primary" onClick={handleRawSave}>
+                          💾 保存修改
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {viewMode === 'tree' && (
+                    <div className="tree-editor">
+                      <pre>{treeData}</pre>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="empty-state">
+                  <div className="empty-icon">📝</div>
+                  <p>选择设备或打开JSON文件开始编辑</p>
+                  <p className="empty-hint">支持本地文件和URL导入</p>
                 </div>
-              </div>
-              <code className="path-bar">{selectedDevice.filePath}</code>
-              {viewMode === 'form' && (
-                <div ref={editorRef} className="json-editor-container" />
               )}
-              {viewMode === 'raw' && (
-                <div className="raw-editor">
-                  <textarea
-                    value={rawJson}
-                    onChange={e => setRawJson(e.target.value)}
-                    spellCheck={false}
-                  />
-                  <div className="raw-actions">
-                    <button className="btn-primary" onClick={handleRawSave}>
-                      💾 保存修改
-                    </button>
-                  </div>
-                </div>
-              )}
-              {viewMode === 'tree' && (
-                <div className="tree-editor">
-                  <pre>{treeData}</pre>
-                </div>
-              )}
-            </>
-          ) : (
-            <div className="empty-state">
-              <div className="empty-icon">📝</div>
-              <p>选择设备或打开JSON文件开始编辑</p>
-              <p className="empty-hint">支持本地文件和URL导入</p>
-            </div>
-          )}
-        </main>
+            </main>
+          </>
+        )}
       </div>
-    </div>
+
+      </div>
   )
 }
 

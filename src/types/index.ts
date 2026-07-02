@@ -15,3 +15,20 @@ export interface AppConfig {
   scanPaths: string[]
   lastOpenPath: string
 }
+
+export interface ServerConfig {
+  id: string
+  name: string
+  host: string
+  port: number
+  username: string
+  password: string
+}
+
+export interface ServerFile {
+  name: string
+  path: string
+  size: number
+  modified: string
+  isDir: boolean
+}
