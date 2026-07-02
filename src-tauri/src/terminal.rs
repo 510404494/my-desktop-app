@@ -2,6 +2,7 @@ use std::sync::{Mutex, Arc};
 use std::time::Duration;
 use std::io::{Read, Write};
 use tauri::{State, async_runtime};
+use base64::{self, Engine};
 
 pub struct TerminalState(pub Arc<Mutex<Option<SessionData>>>);
 
@@ -249,46 +250,47 @@ pub async fn terminal_upload_file(
     password: String,
     port: i64,
 ) -> Result<String, String> {
-    let state_clone = state.0.clone();
-    
     let result = async_runtime::spawn_blocking(move || {
-        let state_guard = state_clone.lock().map_err(|e| e.to_string())?;
-        
-        let conn = state_guard.as_mut()
-            .ok_or("未连接到服务器".to_string())?;
-
         let filename = local_path.split('/').last().unwrap_or(&local_path);
         let full_remote_path = format!("{}/{}", remote_path.trim_end_matches('/'), filename);
 
-        let file_content = std::fs::read(&local_path)
-            .map_err(|e| format!("读取本地文件失败: {}", e))?;
-        
-        let base64_content = base64::encode(&file_content);
+        let expect_script = format!(
+            "set timeout 60\n\
+             spawn scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P {} \"{}\" \"{}@{}:{}\"\n\
+             expect {{\n\
+                 \"*password:*\" {{\n                     send \"{}\\r\"\n\
+                     expect {{\n                         \"Opt>\" {{ send \"1\\r\"; exp_continue }}\n\
+                         timeout {{ exit 1 }}\n\
+                     }}\n\
+                 }}\n\
+                 timeout {{ exit 1 }}\n\
+             }}",
+            port,
+            local_path,
+            username,
+            host,
+            remote_path,
+            password
+        );
 
-        let cmd = format!("mkdir -p {} && echo '{}' | base64 -d > {}", remote_path, base64_content, full_remote_path);
-        let cmd_bytes = format!("{}\r", cmd).as_bytes();
-        
-        conn.stdin.write_all(cmd_bytes)
-            .map_err(|e| format!("发送命令失败: {}", e))?;
-        
-        conn.stdin.flush()
-            .map_err(|e| format!("刷新失败: {}", e))?;
+        let temp_file = tempfile::NamedTempFile::new()
+            .map_err(|e| format!("创建临时文件失败: {}", e))?;
 
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        std::fs::write(temp_file.path(), &expect_script)
+            .map_err(|e| format!("写入expect脚本失败: {}", e))?;
 
-        let cleaned = {
-            let buffer = conn.output_buffer.lock().unwrap();
-            let mut last_pos_guard = conn.last_read_pos.lock().unwrap();
-            let last_pos = *last_pos_guard;
-            let new_content = &buffer[last_pos..];
-            *last_pos_guard = buffer.len();
-            clean_output(new_content)
-        };
+        let output = std::process::Command::new("expect")
+            .arg(temp_file.path())
+            .output()
+            .map_err(|e| format!("执行expect失败: {}", e))?;
 
-        if cleaned.contains("No such file or directory") || cleaned.contains("Permission denied") || cleaned.contains("base64:") {
-            Err(format!("上传失败: {}", cleaned))
-        } else {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if output.status.success() {
             Ok(format!("上传成功: {}", full_remote_path))
+        } else {
+            Err(format!("上传失败: {} | {}", stdout, stderr))
         }
     }).await;
 
