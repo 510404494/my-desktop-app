@@ -260,7 +260,12 @@ pub async fn terminal_upload_file(
         let filename = local_path.split('/').last().unwrap_or(&local_path);
         let full_remote_path = format!("{}/{}", remote_path.trim_end_matches('/'), filename);
 
-        let cmd = format!("mkdir -p {} && cat > {} < /dev/stdin", remote_path, full_remote_path);
+        let file_content = std::fs::read(&local_path)
+            .map_err(|e| format!("读取本地文件失败: {}", e))?;
+        
+        let base64_content = base64::encode(&file_content);
+
+        let cmd = format!("mkdir -p {} && echo '{}' | base64 -d > {}", remote_path, base64_content, full_remote_path);
         let cmd_bytes = format!("{}\r", cmd).as_bytes();
         
         conn.stdin.write_all(cmd_bytes)
@@ -269,21 +274,7 @@ pub async fn terminal_upload_file(
         conn.stdin.flush()
             .map_err(|e| format!("刷新失败: {}", e))?;
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        let file_content = std::fs::read(&local_path)
-            .map_err(|e| format!("读取本地文件失败: {}", e))?;
-        
-        conn.stdin.write_all(&file_content)
-            .map_err(|e| format!("发送文件内容失败: {}", e))?;
-        
-        conn.stdin.write_all(b"\x04")
-            .map_err(|e| format!("发送EOF失败: {}", e))?;
-        
-        conn.stdin.flush()
-            .map_err(|e| format!("刷新失败: {}", e))?;
-
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        std::thread::sleep(std::time::Duration::from_millis(1500));
 
         let cleaned = {
             let buffer = conn.output_buffer.lock().unwrap();
@@ -294,7 +285,7 @@ pub async fn terminal_upload_file(
             clean_output(new_content)
         };
 
-        if cleaned.contains("No such file or directory") || cleaned.contains("Permission denied") {
+        if cleaned.contains("No such file or directory") || cleaned.contains("Permission denied") || cleaned.contains("base64:") {
             Err(format!("上传失败: {}", cleaned))
         } else {
             Ok(format!("上传成功: {}", full_remote_path))
