@@ -245,52 +245,81 @@ pub async fn terminal_upload_file(
     state: State<'_, TerminalState>,
     local_path: String,
     remote_path: String,
-    host: String,
-    username: String,
-    password: String,
-    port: i64,
+    _host: String,
+    _username: String,
+    _password: String,
+    _port: i64,
 ) -> Result<String, String> {
+    let state_clone = state.0.clone();
+    
     let result = async_runtime::spawn_blocking(move || {
+        let mut state_guard = state_clone.lock().map_err(|e| e.to_string())?;
+        
+        let conn = state_guard.as_mut()
+            .ok_or("未连接到服务器".to_string())?;
+
         let filename = local_path.split('/').last().unwrap_or(&local_path);
         let full_remote_path = format!("{}/{}", remote_path.trim_end_matches('/'), filename);
 
-        let expect_script = format!(
-            "set timeout 60\n\
-             spawn scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P {} \"{}\" \"{}@{}:{}\"\n\
-             expect {{\n\
-                 \"*password:*\" {{\n                     send \"{}\\r\"\n\
-                     expect {{\n                         \"Opt>\" {{ send \"1\\r\"; exp_continue }}\n\
-                         timeout {{ exit 1 }}\n\
-                     }}\n\
-                 }}\n\
-                 timeout {{ exit 1 }}\n\
-             }}",
-            port,
-            local_path,
-            username,
-            host,
-            remote_path,
-            password
-        );
+        let file_content = std::fs::read(&local_path)
+            .map_err(|e| format!("读取本地文件失败: {}", e))?;
 
-        let temp_file = tempfile::NamedTempFile::new()
-            .map_err(|e| format!("创建临时文件失败: {}", e))?;
+        let base64_content = base64::engine::general_purpose::STANDARD.encode(&file_content);
 
-        std::fs::write(temp_file.path(), &expect_script)
-            .map_err(|e| format!("写入expect脚本失败: {}", e))?;
+        let chunk_size = 80;
+        let chunks: Vec<String> = base64_content.as_str().chars()
+            .collect::<Vec<_>>()
+            .chunks(chunk_size)
+            .map(|c| c.iter().collect::<String>())
+            .collect();
 
-        let output = std::process::Command::new("expect")
-            .arg(temp_file.path())
-            .output()
-            .map_err(|e| format!("执行expect失败: {}", e))?;
+        let mkdir_cmd = format!("mkdir -p {}\r", remote_path);
+        conn.stdin.write_all(mkdir_cmd.as_bytes())
+            .map_err(|e| format!("发送mkdir命令失败: {}", e))?;
+        conn.stdin.flush()
+            .map_err(|e| format!("刷新失败: {}", e))?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let init_cmd = format!("echo -n '' > {}.b64\r", full_remote_path);
+        conn.stdin.write_all(init_cmd.as_bytes())
+            .map_err(|e| format!("发送初始化命令失败: {}", e))?;
+        conn.stdin.flush()
+            .map_err(|e| format!("刷新失败: {}", e))?;
+        std::thread::sleep(std::time::Duration::from_millis(200));
 
-        if output.status.success() {
-            Ok(format!("上传成功: {}", full_remote_path))
+        for (i, chunk) in chunks.iter().enumerate() {
+            let append_cmd = format!("echo -n '{}' >> {}.b64\r", chunk, full_remote_path);
+            conn.stdin.write_all(append_cmd.as_bytes())
+                .map_err(|e| format!("发送块 {} 失败: {}", i, e))?;
+            conn.stdin.flush()
+                .map_err(|e| format!("刷新失败: {}", e))?;
+            
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let decode_cmd = format!("base64 -d {}.b64 > {} && rm {}.b64\r", full_remote_path, full_remote_path, full_remote_path);
+        conn.stdin.write_all(decode_cmd.as_bytes())
+            .map_err(|e| format!("发送解码命令失败: {}", e))?;
+        conn.stdin.flush()
+            .map_err(|e| format!("刷新失败: {}", e))?;
+
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        let cleaned = {
+            let buffer = conn.output_buffer.lock().unwrap();
+            let mut last_pos_guard = conn.last_read_pos.lock().unwrap();
+            let last_pos = *last_pos_guard;
+            let new_content = &buffer[last_pos..];
+            *last_pos_guard = buffer.len();
+            clean_output(new_content)
+        };
+
+        if cleaned.contains("No such file or directory") || cleaned.contains("Permission denied") || cleaned.contains("base64:") {
+            Err(format!("上传失败: {}", cleaned))
         } else {
-            Err(format!("上传失败: {} | {}", stdout, stderr))
+            Ok(format!("上传成功: {}", full_remote_path))
         }
     }).await;
 

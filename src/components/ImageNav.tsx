@@ -290,14 +290,24 @@ function PicNav() {
 
   const handleCopyPath = useCallback(async (filename: string) => {
     try {
-      const url = getPicUrl(filename)
+      let urlPath = currentPath
+      if (urlPath.startsWith(DATA_PREFIX)) {
+        urlPath = urlPath.substring(DATA_PREFIX.length)
+      }
+      if (!urlPath.startsWith('/')) {
+        urlPath = '/' + urlPath
+      }
+      if (!urlPath.endsWith('/')) {
+        urlPath = urlPath + '/'
+      }
+      const url = `${BASE_URL}${urlPath}${filename}`
       await navigator.clipboard.writeText(url)
       setCopiedPath(filename)
       setTimeout(() => setCopiedPath(null), 2000)
     } catch (err) {
       console.error('复制失败:', err)
     }
-  }, [])
+  }, [currentPath])
 
   const getPicUrl = (filename: string) => {
     let urlPath = currentPath
