@@ -1,14 +1,15 @@
 use std::sync::{Mutex, Arc};
 use std::time::Duration;
 use std::io::{Read, Write};
+use std::net::TcpStream;
 use tauri::{State, async_runtime};
 use base64::{self, Engine};
 
 pub struct TerminalState(pub Arc<Mutex<Option<SessionData>>>);
 
 pub struct SessionData {
-    stdin: std::process::ChildStdin,
-    process: std::process::Child,
+    channel: ssh2::Channel,
+    sftp: ssh2::Sftp,
     output_buffer: Arc<Mutex<String>>,
     last_read_pos: Arc<Mutex<usize>>,
 }
@@ -29,6 +30,33 @@ fn clean_output(output: &str) -> String {
     result
 }
 
+fn read_until_prompt(channel: &mut ssh2::Channel, buffer: &mut String, timeout: Duration) -> String {
+    let start = std::time::Instant::now();
+    let mut new_content = String::new();
+    
+    while start.elapsed() < timeout {
+        let mut buf = [0; 4096];
+        match channel.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                new_content.push_str(&text);
+                buffer.push_str(&text);
+                
+                if new_content.contains("~]$") || new_content.contains("bash-") || 
+                   new_content.contains("[root@") || new_content.contains("Opt>") ||
+                   new_content.contains("]$") || new_content.contains("# ") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    
+    new_content
+}
+
 #[tauri::command]
 pub async fn terminal_connect(
     state: State<'_, TerminalState>,
@@ -46,92 +74,62 @@ pub async fn terminal_connect(
             return Err("已有连接存在，请先断开".to_string());
         }
 
-        let expect_script = format!(
-            "set timeout 15\n\
-             spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa {}@{} -p {}\n\
-             expect \"*password:*\"\n\
-             send \"{}\\r\"\n\
-             sleep 1\n\
-             send \"1\\r\"\n\
-             expect \"Opt>\"\n\
-             send \"1\\r\"\n\
-             expect {{\n\
-                 \"~]$\" {{}}\n\
-                 \"bash-*\" {{}}\n\
-                 \"[root@*\" {{}}\n\
-                 \"*@* ~]$\" {{}}\n\
-                 \"*@* ~]$\" {{}}\n\
-                 timeout {{ exit 1 }}\n\
-             }}\n\
-             interact",
-            username, host, port, password
-        );
+        let tcp = TcpStream::connect((&host[..], port as u16))
+            .map_err(|e| format!("连接失败: {}", e))?;
 
-        let temp_file = tempfile::NamedTempFile::new()
-            .map_err(|e| format!("Failed to create temp file: {}", e))?;
+        let mut sess = ssh2::Session::new().map_err(|e| format!("创建会话失败: {}", e))?;
+        sess.set_tcp_stream(tcp);
+        sess.handshake().map_err(|e| format!("握手失败: {}", e))?;
+        sess.userauth_password(&username, &password)
+            .map_err(|e| format!("认证失败: {}", e))?;
 
-        std::fs::write(temp_file.path(), &expect_script)
-            .map_err(|e| format!("Failed to write expect script: {}", e))?;
+        if !sess.authenticated() {
+            return Err("认证失败".to_string());
+        }
 
-        let mut child = std::process::Command::new("expect")
-            .arg(temp_file.path())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn expect: {}", e))?;
-
-        let stdin = child.stdin.take()
-            .ok_or("Failed to get stdin")?;
-
-        let stdout = child.stdout.take()
-            .ok_or("Failed to get stdout")?;
+        let mut channel = sess.channel_session()
+            .map_err(|e| format!("创建通道失败: {}", e))?;
+        channel.shell()
+            .map_err(|e| format!("启动shell失败: {}", e))?;
 
         let output_buffer = Arc::new(Mutex::new(String::new()));
-        let last_read_pos = Arc::new(Mutex::new(0));
         let buffer_clone = output_buffer.clone();
         
-        std::thread::spawn(move || {
-            let mut reader = stdout;
-            let mut buf = [0; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let mut buffer = buffer_clone.lock().unwrap();
-                        buffer.push_str(&text);
-                    }
-                    Err(_) => break,
-                }
+        std::thread::sleep(Duration::from_millis(1000));
+        
+        let mut buffer = String::new();
+        let mut output = read_until_prompt(&mut channel, &mut buffer, Duration::from_secs(5));
+        
+        if output.contains("Opt>") {
+            channel.write_all(b"1\r").map_err(|e| format!("发送命令失败: {}", e))?;
+            channel.flush().map_err(|e| format!("刷新失败: {}", e))?;
+            std::thread::sleep(Duration::from_millis(500));
+            output += &read_until_prompt(&mut channel, &mut buffer, Duration::from_secs(5));
+            
+            if output.contains("Opt>") {
+                channel.write_all(b"1\r").map_err(|e| format!("发送命令失败: {}", e))?;
+                channel.flush().map_err(|e| format!("刷新失败: {}", e))?;
+                std::thread::sleep(Duration::from_millis(2000));
+                output += &read_until_prompt(&mut channel, &mut buffer, Duration::from_secs(5));
             }
-        });
+        }
 
-        std::thread::sleep(Duration::from_secs(5));
+        let sftp = sess.sftp().map_err(|e| format!("创建SFTP失败: {}", e))?;
 
-        let cleaned = {
-            let buffer = output_buffer.lock().unwrap();
-            let mut last_pos_guard = last_read_pos.lock().unwrap();
-            let last_pos = *last_pos_guard;
-            let new_content = &buffer[last_pos..];
-            *last_pos_guard = buffer.len();
-            clean_output(new_content)
-        };
-
-        let status = child.try_wait().map_err(|e| format!("检查进程状态失败: {}", e))?;
-        if status.is_some() {
-            let code = status.unwrap().code().unwrap_or(-1);
-            return Err(format!("连接进程已退出，代码: {}", code));
+        let last_read_pos = Arc::new(Mutex::new(buffer.len()));
+        {
+            let mut buf_guard = buffer_clone.lock().unwrap();
+            *buf_guard = buffer;
         }
 
         state_guard.replace(SessionData {
-            stdin,
-            process: child,
+            channel,
+            sftp,
             output_buffer,
             last_read_pos,
         });
 
-        Ok(cleaned)
+        Ok(clean_output(&output))
     }).await;
 
     match result {
@@ -153,21 +151,35 @@ pub async fn terminal_send(
         let conn = state_guard.as_mut()
             .ok_or("未连接到服务器".to_string())?;
 
-        conn.stdin.write_all(format!("{}\r", command).as_bytes())
+        conn.channel.write_all(format!("{}\r", command).as_bytes())
             .map_err(|e| format!("发送命令失败: {}", e))?;
 
-        conn.stdin.flush()
+        conn.channel.flush()
             .map_err(|e| format!("刷新失败: {}", e))?;
 
-        std::thread::sleep(Duration::from_millis(800));
+        std::thread::sleep(Duration::from_millis(1000));
 
         let cleaned = {
-            let buffer = conn.output_buffer.lock().unwrap();
+            let mut buffer = conn.output_buffer.lock().unwrap();
             let mut last_pos_guard = conn.last_read_pos.lock().unwrap();
             let last_pos = *last_pos_guard;
-            let new_content = &buffer[last_pos..];
+            
+            let mut new_content = String::new();
+            let mut buf = [0; 4096];
+            loop {
+                match conn.channel.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                        new_content.push_str(&text);
+                        buffer.push_str(&text);
+                    }
+                    Err(_) => break,
+                }
+            }
+            
             *last_pos_guard = buffer.len();
-            clean_output(new_content)
+            clean_output(&new_content)
         };
         
         Ok(cleaned)
@@ -186,7 +198,7 @@ pub fn terminal_disconnect(
     let mut state_guard = state.0.lock().map_err(|e| e.to_string())?;
     
     if let Some(mut conn) = state_guard.take() {
-        let _ = conn.process.kill();
+        let _ = conn.channel.close();
     }
     
     Ok(())
@@ -214,21 +226,35 @@ pub async fn terminal_list_files(
             .ok_or("未连接到服务器".to_string())?;
 
         let cmd = format!("ls -la {} 2>/dev/null || ls {}", path, path);
-        conn.stdin.write_all(format!("{}\r", cmd).as_bytes())
+        conn.channel.write_all(format!("{}\r", cmd).as_bytes())
             .map_err(|e| format!("发送命令失败: {}", e))?;
 
-        conn.stdin.flush()
+        conn.channel.flush()
             .map_err(|e| format!("刷新失败: {}", e))?;
 
-        std::thread::sleep(Duration::from_millis(800));
+        std::thread::sleep(Duration::from_millis(1000));
 
         let cleaned = {
-            let buffer = conn.output_buffer.lock().unwrap();
+            let mut buffer = conn.output_buffer.lock().unwrap();
             let mut last_pos_guard = conn.last_read_pos.lock().unwrap();
             let last_pos = *last_pos_guard;
-            let new_content = &buffer[last_pos..];
+            
+            let mut new_content = String::new();
+            let mut buf = [0; 4096];
+            loop {
+                match conn.channel.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                        new_content.push_str(&text);
+                        buffer.push_str(&text);
+                    }
+                    Err(_) => break,
+                }
+            }
+            
             *last_pos_guard = buffer.len();
-            clean_output(new_content)
+            clean_output(&new_content)
         };
         
         Ok(cleaned)
@@ -264,34 +290,37 @@ pub async fn terminal_upload_file(
         let file_content = std::fs::read(&local_path)
             .map_err(|e| format!("读取本地文件失败: {}", e))?;
 
-        let base64_content = base64::engine::general_purpose::STANDARD.encode(&file_content);
+        let chunks: Vec<String> = file_content.as_slice().chunks(8192)
+            .map(|c| String::from_utf8_lossy(c).to_string())
+            .collect();
 
+        let mkdir_cmd = format!("mkdir -p {}\r", remote_path);
+        conn.channel.write_all(mkdir_cmd.as_bytes())
+            .map_err(|e| format!("发送mkdir命令失败: {}", e))?;
+        conn.channel.flush()
+            .map_err(|e| format!("刷新失败: {}", e))?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let base64_content = base64::engine::general_purpose::STANDARD.encode(&file_content);
         let chunk_size = 80;
-        let chunks: Vec<String> = base64_content.as_str().chars()
+        let base64_chunks: Vec<String> = base64_content.as_str().chars()
             .collect::<Vec<_>>()
             .chunks(chunk_size)
             .map(|c| c.iter().collect::<String>())
             .collect();
 
-        let mkdir_cmd = format!("mkdir -p {}\r", remote_path);
-        conn.stdin.write_all(mkdir_cmd.as_bytes())
-            .map_err(|e| format!("发送mkdir命令失败: {}", e))?;
-        conn.stdin.flush()
-            .map_err(|e| format!("刷新失败: {}", e))?;
-        std::thread::sleep(std::time::Duration::from_millis(300));
-
         let init_cmd = format!("echo -n '' > {}.b64\r", full_remote_path);
-        conn.stdin.write_all(init_cmd.as_bytes())
+        conn.channel.write_all(init_cmd.as_bytes())
             .map_err(|e| format!("发送初始化命令失败: {}", e))?;
-        conn.stdin.flush()
+        conn.channel.flush()
             .map_err(|e| format!("刷新失败: {}", e))?;
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        for (i, chunk) in chunks.iter().enumerate() {
+        for (i, chunk) in base64_chunks.iter().enumerate() {
             let append_cmd = format!("echo -n '{}' >> {}.b64\r", chunk, full_remote_path);
-            conn.stdin.write_all(append_cmd.as_bytes())
+            conn.channel.write_all(append_cmd.as_bytes())
                 .map_err(|e| format!("发送块 {} 失败: {}", i, e))?;
-            conn.stdin.flush()
+            conn.channel.flush()
                 .map_err(|e| format!("刷新失败: {}", e))?;
             
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -300,20 +329,34 @@ pub async fn terminal_upload_file(
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         let decode_cmd = format!("base64 -d {}.b64 > {} && rm {}.b64\r", full_remote_path, full_remote_path, full_remote_path);
-        conn.stdin.write_all(decode_cmd.as_bytes())
+        conn.channel.write_all(decode_cmd.as_bytes())
             .map_err(|e| format!("发送解码命令失败: {}", e))?;
-        conn.stdin.flush()
+        conn.channel.flush()
             .map_err(|e| format!("刷新失败: {}", e))?;
 
         std::thread::sleep(std::time::Duration::from_millis(1500));
 
         let cleaned = {
-            let buffer = conn.output_buffer.lock().unwrap();
+            let mut buffer = conn.output_buffer.lock().unwrap();
             let mut last_pos_guard = conn.last_read_pos.lock().unwrap();
             let last_pos = *last_pos_guard;
-            let new_content = &buffer[last_pos..];
+            
+            let mut new_content = String::new();
+            let mut buf = [0; 4096];
+            loop {
+                match conn.channel.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                        new_content.push_str(&text);
+                        buffer.push_str(&text);
+                    }
+                    Err(_) => break,
+                }
+            }
+            
             *last_pos_guard = buffer.len();
-            clean_output(new_content)
+            clean_output(&new_content)
         };
 
         if cleaned.contains("No such file or directory") || cleaned.contains("Permission denied") || cleaned.contains("base64:") {
