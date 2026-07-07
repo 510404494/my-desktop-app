@@ -17,13 +17,10 @@ jobs:
         include:
           - platform: macos-latest
             target: aarch64-apple-darwin
-            artifact: macos
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            artifact: linux
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: windows
 
     runs-on: ${{ matrix.platform }}
 
@@ -50,7 +47,7 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build Tauri app
+      - name: Build and upload Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -58,48 +55,9 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tauriScript: npx tauri
-          tagName: v__VERSION__
-          releaseName: "v__VERSION__"
+          tagName: ${{ github.ref_name }}
+          releaseName: "Release ${{ github.ref_name }}"
           releaseBody: "See the assets to download and install this version."
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }}
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}-build
-          path: |
-            src-tauri/target/release/bundle/**/*
-          if-no-files-found: error
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: List downloaded files
-        run: find artifacts -type f | head -30
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          body: "See the assets to download and install this version."
-          draft: false
-          prerelease: false
-          files: |
-            artifacts/**/*.dmg
-            artifacts/**/*.deb
-            artifacts/**/*.rpm
-            artifacts/**/*.AppImage
-            artifacts/**/*.msi
-            artifacts/**/*.exe
-            artifacts/**/*.zip
