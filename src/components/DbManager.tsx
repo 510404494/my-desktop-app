@@ -25,6 +25,9 @@ function DbManager() {
   const [editData, setEditData] = useState<EditRow>({})
   const [showAddForm, setShowAddForm] = useState(false)
   const [addData, setAddData] = useState<EditRow>({})
+  const [showPasswordModal, setShowPasswordModal] = useState(false)
+  const [passwordInput, setPasswordInput] = useState('123456')
+  const [pendingTable, setPendingTable] = useState<string | null>(null)
 
   const loadTables = useCallback(async () => {
     if (!isTauri()) return
@@ -44,6 +47,12 @@ function DbManager() {
   const loadTableData = useCallback(async (tableName: string) => {
     if (!isTauri()) return
 
+    if (tableName === 'servers') {
+      setPendingTable(tableName)
+      setShowPasswordModal(true)
+      return
+    }
+
     setLoading(true)
     try {
       const result = await invoke<string>('get_table_data', { table: tableName })
@@ -58,6 +67,24 @@ function DbManager() {
     } finally {
       setLoading(false)
     }
+  }, [])
+
+  const handlePasswordSubmit = useCallback(async () => {
+    if (passwordInput === '孔令强') {
+      setShowPasswordModal(false)
+      if (pendingTable) {
+        await loadTableData(pendingTable)
+      }
+    } else {
+      setActionResult({ success: false, message: '密码错误，请重试' })
+      setTimeout(() => setActionResult(null), 3000)
+    }
+  }, [passwordInput, pendingTable, loadTableData])
+
+  const handlePasswordCancel = useCallback(() => {
+    setShowPasswordModal(false)
+    setPendingTable(null)
+    setPasswordInput('123456')
   }, [])
 
   const clearTableData = useCallback(async (tableName: string) => {
@@ -217,6 +244,34 @@ function DbManager() {
         <div className={`action-result ${actionResult.success ? 'success' : 'error'}`}>
           <span className="result-icon">{actionResult.success ? '✓' : '✗'}</span>
           <span className="result-message">{actionResult.message}</span>
+        </div>
+      )}
+
+      {showPasswordModal && (
+        <div className="password-modal" onClick={handlePasswordCancel}>
+          <div className="password-modal-content" onClick={(e) => e.stopPropagation()}>
+            <h3>🔒 验证身份</h3>
+            <p className="password-modal-desc">查看 servers 表需要输入密码</p>
+            <div className="password-modal-form">
+              <input
+                type="password"
+                className="password-input"
+                placeholder="请输入密码"
+                value={passwordInput}
+                onChange={(e) => setPasswordInput(e.target.value)}
+                autoFocus
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    handlePasswordSubmit()
+                  }
+                }}
+              />
+            </div>
+            <div className="password-modal-actions">
+              <button className="btn-primary" onClick={handlePasswordSubmit}>确认</button>
+              <button className="btn-secondary" onClick={handlePasswordCancel}>取消</button>
+            </div>
+          </div>
         </div>
       )}
 
