@@ -1442,6 +1442,22 @@ button {
   color: #475569;
 }
 
+.image-modal-info {
+  display: flex;
+  gap: 16px;
+  justify-content: center;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #64748b;
+  flex-wrap: wrap;
+}
+
+.image-info-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .image-modal-actions {
   display: flex;
   gap: 8px;

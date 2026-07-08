@@ -290,6 +290,76 @@ pub async fn terminal_list_files(
 }
 
 #[tauri::command]
+pub async fn terminal_file_info(
+    state: State<'_, TerminalState>,
+    file_path: String,
+) -> Result<String, String> {
+    let state_clone = state.0.clone();
+    
+    let result = async_runtime::spawn_blocking(move || {
+        let mut state_guard = state_clone.lock().map_err(|e| e.to_string())?;
+        
+        let conn = state_guard.as_mut()
+            .ok_or("未连接到服务器".to_string())?;
+
+        let cmd = format!("stat -c '%s %y' '{}' 2>/dev/null || ls -la '{}' 2>/dev/null", file_path, file_path);
+        conn.channel.write_all(format!("{}\r", cmd).as_bytes())
+            .map_err(|e| format!("发送命令失败: {}", e))?;
+
+        conn.channel.flush()
+            .map_err(|e| format!("刷新失败: {}", e))?;
+
+        std::thread::sleep(Duration::from_millis(800));
+
+        let cleaned = {
+            let mut buffer = conn.output_buffer.lock().unwrap();
+            let mut last_pos_guard = conn.last_read_pos.lock().unwrap();
+            
+            let mut new_content = String::new();
+            let mut buf = [0; 4096];
+            let start = std::time::Instant::now();
+            
+            loop {
+                match conn.channel.read(&mut buf) {
+                    Ok(0) => {
+                        if start.elapsed() > Duration::from_millis(600) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Ok(n) => {
+                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                        new_content.push_str(&text);
+                        buffer.push_str(&text);
+                        if new_content.contains("]$") || new_content.contains("[root@") || 
+                           new_content.contains("[dev@") {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => {
+                        if start.elapsed() > Duration::from_millis(600) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+            
+            *last_pos_guard = buffer.len();
+            clean_output(&new_content)
+        };
+        
+        Ok(cleaned)
+    }).await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
 pub async fn terminal_upload_file(
     state: State<'_, TerminalState>,
     local_path: String,

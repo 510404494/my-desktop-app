@@ -156,6 +156,7 @@ function parseLsOutput(output: string): RemoteFile[] {
 function PicNav() {
   const [groups, setGroups] = useState<ImageGroup[]>([])
   const [selectedPic, setSelectedPic] = useState<string | null>(null)
+  const [imageInfo, setImageInfo] = useState<{ width: number; height: number; size: string; date: string } | null>(null)
   const [metadata, setMetadata] = useState<Record<string, ImageMetadata>>({})
   const [filter, setFilter] = useState('')
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null)
@@ -353,6 +354,44 @@ function PicNav() {
 
   const handleImgError = (e: React.SyntheticEvent<HTMLImageElement>) => {
     e.currentTarget.src = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI4MCIgaGVpZ2h0PSI4MCI+PHJlY3Qgd2lkdGg9IjgwIiBoZWlnaHQ9IjgwIiBmaWxsPSIjMmQzNzQ4Ii8+PHRleHQgeD0iNTAlIiB5PSI1MCUiIGRvbWluYW50LWFsaWduPSJtaWRkbGUiIGZpbGw9IiM3MTgwOTYiIGZvbnQtc2l6ZT0iMTIiPk5vdCBGb3VuZDwvdGV4dD48L3N2Zz4='
+  }
+
+  const handleImageLoad = async (e: React.SyntheticEvent<HTMLImageElement>) => {
+    const img = e.currentTarget
+    const width = img.naturalWidth
+    const height = img.naturalHeight
+    
+    if (!isTauri() || !isServerConnected || !selectedPic) {
+      setImageInfo({ width, height, size: '未知', date: '未知' })
+      return
+    }
+
+    try {
+      const filePath = `${currentPath}/${selectedPic}`
+      const result = await invoke<string>('terminal_file_info', { file_path: filePath })
+      
+      const lines = result.split('\n').filter(line => line.trim().length > 0)
+      let size = '未知'
+      let date = '未知'
+      
+      for (const line of lines) {
+        if (line.includes(selectedPic)) {
+          const parts = line.trim().split(/\s+/)
+          if (parts.length >= 9) {
+            size = parts[4]
+            date = `${parts[5]} ${parts[6]}`
+          } else if (parts.length >= 2) {
+            size = parts[0]
+            date = parts[1]
+          }
+          break
+        }
+      }
+      
+      setImageInfo({ width, height, size, date })
+    } catch {
+      setImageInfo({ width, height, size: '未知', date: '未知' })
+    }
   }
 
   const handleDirSelect = useCallback((dir: { name: string; path: string }) => {
@@ -756,8 +795,16 @@ function PicNav() {
                 src={getPicUrl(selectedPic)}
                 alt={selectedPic}
                 onError={handleImgError}
+                onLoad={handleImageLoad}
               />
               <div className="image-modal-name">{selectedPic}</div>
+              {imageInfo && (
+                <div className="image-modal-info">
+                  <span className="image-info-item">📐 {imageInfo.width} × {imageInfo.height}</span>
+                  <span className="image-info-item">📦 {imageInfo.size} bytes</span>
+                  <span className="image-info-item">📅 {imageInfo.date}</span>
+                </div>
+              )}
               {editingGroupId && editingMetadata ? (
                 <div className="image-modal-edit">
                   <input
