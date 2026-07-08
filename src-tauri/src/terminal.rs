@@ -89,6 +89,8 @@ pub async fn terminal_connect(
 
         let mut channel = sess.channel_session()
             .map_err(|e| format!("创建通道失败: {}", e))?;
+        channel.request_pty("xterm", None, None)
+            .map_err(|e| format!("请求PTY失败: {}", e))?;
         channel.shell()
             .map_err(|e| format!("启动shell失败: {}", e))?;
 
