@@ -656,6 +656,7 @@ button {
   flex-direction: column;
   overflow: hidden;
   position: relative;
+  padding-bottom: 48px;
 }
 
 .terminal-output-wrapper {
@@ -723,6 +724,11 @@ button {
   padding: 8px 12px;
   background: #161b22;
   border-top: 1px solid #30363d;
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
 }
 
 .terminal-prompt {

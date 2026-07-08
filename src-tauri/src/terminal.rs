@@ -19,8 +19,12 @@ fn clean_output(output: &str) -> String {
     let re2 = regex::Regex::new(r"\x1b\][0-9;]*[^\x07]*\x07").unwrap();
     let re3 = regex::Regex::new(r"\x1b[\[\]()][0-9;]*[a-zA-Z]?").unwrap();
     let re4 = regex::Regex::new(r"[\x00-\x08\x0b\x0c\x0e-\x1f]").unwrap();
+    let re5 = regex::Regex::new(r"\x1b[^\x1b]*\x1b\\").unwrap();
+    let re6 = regex::Regex::new(r"\?[0-9]+h").unwrap();
     
     let mut result = output.to_string();
+    result = re5.replace_all(&result, "").to_string();
+    result = re6.replace_all(&result, "").to_string();
     result = re2.replace_all(&result, "").to_string();
     result = re3.replace_all(&result, "").to_string();
     result = re1.replace_all(&result, "").to_string();
@@ -159,7 +163,7 @@ pub async fn terminal_send(
         conn.channel.flush()
             .map_err(|e| format!("刷新失败: {}", e))?;
 
-        std::thread::sleep(Duration::from_millis(1000));
+        std::thread::sleep(Duration::from_millis(500));
 
         let cleaned = {
             let mut buffer = conn.output_buffer.lock().unwrap();
@@ -168,15 +172,32 @@ pub async fn terminal_send(
             
             let mut new_content = String::new();
             let mut buf = [0; 4096];
+            let start = std::time::Instant::now();
+            
             loop {
                 match conn.channel.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        if start.elapsed() > Duration::from_millis(800) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                     Ok(n) => {
                         let text = String::from_utf8_lossy(&buf[..n]).to_string();
                         new_content.push_str(&text);
                         buffer.push_str(&text);
+                        if new_content.contains("~]$") || new_content.contains("]$") || 
+                           new_content.contains("[root@") || new_content.contains("[dev@") {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        if start.elapsed() > Duration::from_millis(800) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                 }
             }
             
